@@ -25,7 +25,27 @@ No dependencies. Python 3.10+. Exits `1` when it finds something, `0` when it do
 ## Does it work?
 
 It was written after finding two of these by hand, then validated against three real
-repositories. It reproduced all three findings independently.
+repositories — it reproduced all three independently. Sweeping further projects then found
+three more, each verified by running the affected code on Windows.
+
+| Project | Found | Verified how |
+|---|---|---|
+| pylint | 2 committed symlinks break a functional test | Full suite: only failure |
+| MCP Python SDK | `symlink_to()` in a test, unguarded | Suite: 1 failed → 0 |
+| lerobot | `update_last_checkpoint()` on the training path | Already upstream as #4059 |
+| **mlflow** | `mlflow-skinny` builds an **empty wheel** | Built it: 6 entries, 0 `.py` files |
+| **pipx** | Whole suite errors — `suppress(FileExistsError)` misses `OSError` | pytest: 5 errors → 5 passed |
+| **black** | 3 symlink tests unguarded — regression of their own #287 | Suite: 3 failed → 0 failed |
+
+The black one is the clearest illustration of the thesis. black fixed this exact failure
+in 2018 (#287) by guarding one test. Tests added later did not carry the guard, and CI
+never noticed, because CI's Windows runner can create symlinks. A bug can be fixed, come
+back, and stay back — while the badge stays green the whole time.
+
+Roughly half of a sweep's raw hits are not bugs. virtualenv and black's
+`test_broken_symlink` were flagged and turned out correctly guarded; that is what
+prompted the AST guard-detection pass, which drops optuna to zero findings and cuts
+virtualenv from 10 to 7.
 
 ### pylint — the functional test that fails on every Windows checkout
 
@@ -110,11 +130,14 @@ tracked symlinks in a repo with no Windows CI at all is its own result.
 
 Stated plainly, because a tool that overstates its confidence is worse than no tool.
 
-- **It flags call sites, not bugs.** A `symlink_to()` already wrapped in `try/except` is
-  still reported; it does not track whether the call is guarded. Every finding needs a
-  human to confirm.
-- **Line-based matching, not AST.** It skips whole-line comments, but a `symlink_to(` in a
-  docstring or a string literal will be reported.
+- **It flags call sites, not bugs.** The AST pass understands `try/except OSError` and
+  `with suppress(OSError)`, and reports those separately as a count. It does **not**
+  understand `pytest.mark.skipif`, or a guard several frames up the call stack, so every
+  finding still needs a human to confirm.
+- **Guard detection is deliberately narrow.** Only exception types that actually cover a
+  bare `OSError` count. `suppress(FileExistsError)` does not — that exact mistake is why
+  pipx's entire test suite fails on Windows, so treating it as a guard would have hidden
+  a real bug.
 - **The workflow parse is deliberately crude.** It scans for runner names anywhere in the
   file rather than resolving YAML anchors and matrix expressions, so a platform named only
   in a disabled or conditional job still counts as covered. It errs toward reporting
