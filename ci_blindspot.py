@@ -20,6 +20,7 @@ Usage:
 
 from __future__ import annotations
 
+import ast
 import re
 import subprocess
 import sys
@@ -29,16 +30,26 @@ from pathlib import Path
 # runs-on values, plus bare matrix entries like `os: [ubuntu-latest, windows-latest]`
 _RUNNER_RE = re.compile(r"(ubuntu|windows|macos)-[a-z0-9.]+", re.I)
 
-# Calls that need elevation or Developer Mode on Windows. A CI runner has both, so
-# these are invisible to a green windows-latest job.
+_SYMLINK = "creates a symlink (needs elevation or Developer Mode on Windows)"
+_POSIX_ONLY = "POSIX-only: no Windows equivalent"
+
+# Calls that need a privilege a CI runner has and an ordinary user does not, keyed by
+# the trailing dotted name of the call.
 _PRIVILEGED_CALLS = {
-    ".symlink_to(": "creates a symlink (needs elevation or Developer Mode on Windows)",
-    "os.symlink(": "creates a symlink (needs elevation or Developer Mode on Windows)",
-    "os.link(": "creates a hard link (restricted on some Windows filesystems)",
-    "os.mkfifo(": "POSIX-only: no Windows equivalent",
-    "os.fork(": "POSIX-only: no Windows equivalent",
-    "os.geteuid(": "POSIX-only: no Windows equivalent",
+    "symlink_to": _SYMLINK,
+    "os.symlink": _SYMLINK,
+    "os.link": "creates a hard link (restricted on some Windows filesystems)",
+    "os.mkfifo": _POSIX_ONLY,
+    "os.fork": _POSIX_ONLY,
+    "os.geteuid": _POSIX_ONLY,
 }
+
+# Catching any of these covers WinError 1314, which arrives as a plain OSError.
+# FileExistsError and friends are subclasses and do NOT cover it - that exact mistake
+# is why pipx's whole test suite fails on Windows.
+_BROAD_EXCEPTIONS = frozenset(
+    {"OSError", "EnvironmentError", "IOError", "WindowsError", "Exception", "BaseException"}
+)
 
 PLATFORMS = ("linux", "windows", "macos")
 
@@ -55,6 +66,7 @@ class Report:
     ci_platforms: set[str] = field(default_factory=set)
     workflows: int = 0
     findings: list[Finding] = field(default_factory=list)
+    guarded: int = 0  # calls found but correctly handled; reported as a count only
 
     @property
     def uncovered(self) -> list[str]:
@@ -98,26 +110,106 @@ def tracked_symlinks(repo: Path) -> list[str]:
     ]
 
 
-def privileged_calls(repo: Path) -> list[Finding]:
-    """Source-level calls that a privileged CI runner will never fail on."""
+def _dotted(node: ast.expr) -> str:
+    """Best-effort dotted name for a call target: `a.b.c` -> "a.b.c"."""
+    if isinstance(node, ast.Attribute):
+        base = _dotted(node.value)
+        return f"{base}.{node.attr}" if base else node.attr
+    if isinstance(node, ast.Name):
+        return node.id
+    return ""
+
+
+def _match(dotted: str) -> str | None:
+    """The reason this call is privilege-dependent, or None."""
+    if not dotted:
+        return None
+    for key, why in _PRIVILEGED_CALLS.items():
+        if dotted == key or dotted.endswith("." + key):
+            return why
+    # `p.symlink_to(...)` on any receiver
+    if dotted.rsplit(".", 1)[-1] == "symlink_to":
+        return _SYMLINK
+    return None
+
+
+def _names_in(node: ast.expr | None) -> list[str]:
+    if node is None:
+        return []
+    if isinstance(node, ast.Tuple):
+        return [n for e in node.elts for n in _names_in(e)]
+    name = _dotted(node)
+    return [name.rsplit(".", 1)[-1]] if name else []
+
+
+def _handler_is_broad(handler: ast.ExceptHandler) -> bool:
+    """True if this `except` would catch a bare OSError."""
+    if handler.type is None:  # bare `except:`
+        return True
+    return any(n in _BROAD_EXCEPTIONS for n in _names_in(handler.type))
+
+
+def _suppresses_broadly(item: ast.withitem) -> bool:
+    """True for `with suppress(OSError)` and friends, false for suppress(FileExistsError)."""
+    call = item.context_expr
+    if not isinstance(call, ast.Call):
+        return False
+    if _dotted(call.func).rsplit(".", 1)[-1] != "suppress":
+        return False
+    return any(n in _BROAD_EXCEPTIONS for arg in call.args for n in _names_in(arg))
+
+
+def _scan(node: ast.AST, guarded: bool, out: list[tuple[int, str, bool]]) -> None:
+    """Walk the tree, tracking whether we are inside a guard that covers OSError."""
+    if isinstance(node, ast.Try):
+        inner = guarded or any(_handler_is_broad(h) for h in node.handlers)
+        for child in node.body:
+            _scan(child, inner, out)
+        for handler in node.handlers:
+            for child in handler.body:
+                _scan(child, guarded, out)
+        for child in [*node.orelse, *node.finalbody]:
+            _scan(child, guarded, out)
+        return
+
+    if isinstance(node, (ast.With, ast.AsyncWith)):
+        inner = guarded or any(_suppresses_broadly(i) for i in node.items)
+        for child in node.body:
+            _scan(child, inner, out)
+        return
+
+    if isinstance(node, ast.Call):
+        why = _match(_dotted(node.func))
+        if why:
+            out.append((node.lineno, why, guarded))
+
+    for child in ast.iter_child_nodes(node):
+        _scan(child, guarded, out)
+
+
+def privileged_calls(repo: Path) -> tuple[list[Finding], int]:
+    """Unguarded privilege-dependent calls, plus a count of guarded ones."""
     findings: list[Finding] = []
+    guarded_count = 0
     skip = {".git", ".venv", "venv", "node_modules", "__pycache__", "build", "dist"}
 
     for path in repo.rglob("*.py"):
         if skip & set(path.parts):
             continue
         try:
-            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-        except OSError:
+            tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, SyntaxError, ValueError):
             continue
-        for lineno, line in enumerate(lines, 1):
-            if line.lstrip().startswith("#"):
-                continue
-            for needle, why in _PRIVILEGED_CALLS.items():
-                if needle in line:
-                    rel = path.relative_to(repo).as_posix()
-                    findings.append(Finding("privileged-call", f"{rel}:{lineno}", why))
-    return findings
+
+        hits: list[tuple[int, str, bool]] = []
+        _scan(tree, False, hits)
+        rel = path.relative_to(repo).as_posix()
+        for lineno, why, guarded in hits:
+            if guarded:
+                guarded_count += 1
+            else:
+                findings.append(Finding("privileged-call", f"{rel}:{lineno}", why))
+    return findings, guarded_count
 
 
 def analyse(repo: Path) -> Report:
@@ -133,7 +225,8 @@ def analyse(repo: Path) -> Report:
                 "file holding the link target instead",
             )
         )
-    report.findings.extend(privileged_calls(repo))
+    calls, report.guarded = privileged_calls(repo)
+    report.findings.extend(calls)
     return report
 
 
@@ -160,11 +253,14 @@ def render(repo: Path, report: Report) -> str:
             out.append(f"  ... and {len(symlinks) - 20} more")
 
     if privileged:
-        out += ["", f"Privilege-dependent calls ({len(privileged)}):"]
+        out += ["", f"Unguarded privilege-dependent calls ({len(privileged)}):"]
         for f in privileged[:20]:
             out.append(f"  {f.location}\n      {f.detail}")
         if len(privileged) > 20:
             out.append(f"  ... and {len(privileged) - 20} more")
+
+    if report.guarded:
+        out.append(f"\n({report.guarded} further call(s) found, already guarded against OSError)")
 
     out.append("")
     if report.findings and windows_in_ci:
@@ -199,11 +295,36 @@ def self_check() -> int:
             "  b:\n    runs-on: windows-latest\n",
             encoding="utf-8",
         )
+        # One unguarded call, and four that are guarded in different ways. Only the
+        # first should be reported. The suppress(FileExistsError) case is the pipx bug:
+        # it looks like a guard and does not catch WinError 1314.
         (repo / "code.py").write_text(
+            "import os\n"
+            "from contextlib import suppress\n"
             "from pathlib import Path\n"
-            "def f(p):\n"
-            "    (p / 'link').symlink_to(p)\n"
-            "# os.symlink( in a comment must not count\n",
+            "\n"
+            "def unguarded(p):\n"
+            "    (p / 'a').symlink_to(p)\n"
+            "\n"
+            "def guarded_try(p):\n"
+            "    try:\n"
+            "        (p / 'b').symlink_to(p)\n"
+            "    except OSError:\n"
+            "        pass\n"
+            "\n"
+            "def guarded_tuple(p):\n"
+            "    try:\n"
+            "        os.symlink(p, p / 'c')\n"
+            "    except (OSError, NotImplementedError):\n"
+            "        pass\n"
+            "\n"
+            "def guarded_suppress(p):\n"
+            "    with suppress(OSError):\n"
+            "        (p / 'd').symlink_to(p)\n"
+            "\n"
+            "def narrow_suppress(p):\n"
+            "    with suppress(FileExistsError):\n"
+            "        (p / 'e').symlink_to(p)\n",
             encoding="utf-8",
         )
 
@@ -212,12 +333,14 @@ def self_check() -> int:
         assert report.ci_platforms == {"linux", "windows"}, report.ci_platforms
         assert report.uncovered == ["macos"], report.uncovered
 
-        calls = [f for f in report.findings if f.kind == "privileged-call"]
-        assert len(calls) == 1, f"expected 1 privileged call, got {calls}"
-        assert calls[0].location == "code.py:3", calls[0].location
+        calls = sorted(f.location for f in report.findings if f.kind == "privileged-call")
+        # line 6 = unguarded, line 26 = the narrow suppress that misses OSError
+        assert calls == ["code.py:26", "code.py:6"], calls
+        assert report.guarded == 3, report.guarded
 
         text = render(repo, report)
         assert "Windows is in the CI matrix" in text, text
+        assert "already guarded" in text, text
 
         # A clean repo must produce no findings and say so.
         clean = Path(tmp) / "clean"
