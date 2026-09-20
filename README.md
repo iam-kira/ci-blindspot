@@ -22,6 +22,21 @@ python ci_blindspot.py --self-check
 
 No dependencies. Python 3.10+. Exits `1` when it finds something, `0` when it doesn't.
 
+## Install
+
+It's a single file with no dependencies — the simplest use is to run it directly:
+
+```
+python ci_blindspot.py path/to/repo
+```
+
+Or install the console command:
+
+```
+pip install git+https://github.com/iam-kira/ci-blindspot
+ci-blindspot path/to/repo
+```
+
 ## Does it work?
 
 It was written after finding two of these by hand, then validated against three real
@@ -156,3 +171,7 @@ reported because users hit them; test bugs do not, because the only people who s
 assume it is their own fault.
 
 That asymmetry is the entire reason this tool finds anything.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

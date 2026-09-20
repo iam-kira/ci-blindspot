@@ -51,6 +51,20 @@ _BROAD_EXCEPTIONS = frozenset(
     {"OSError", "EnvironmentError", "IOError", "WindowsError", "Exception", "BaseException"}
 )
 
+# Substrings that mark an expression as platform-conditional. A call sitting under
+# `if sys.platform != "win32":` or a test decorated with a skipif that mentions win32
+# is already handled, even though no exception is caught anywhere near it.
+_PLATFORM_TOKENS = (
+    "platform", "win32", "windows", "_win", "iswin", "nt", "posix",
+    # A guard keyed on symlink support itself, e.g. django's
+    # `@skipUnless(symlinks_supported(), ...)`, is as good as a platform check.
+    "symlink",
+)
+
+# unittest spells these skipIf / skipUnless; pytest spells them skipif. Match either,
+# case-insensitively, or a decorator like these misses entirely.
+_SKIP_DECORATORS = ("skipif", "skipunless", "xfail")
+
 PLATFORMS = ("linux", "windows", "macos")
 
 
@@ -142,6 +156,60 @@ def _names_in(node: ast.expr | None) -> list[str]:
     return [name.rsplit(".", 1)[-1]] if name else []
 
 
+def _mentions_platform(node: ast.AST | None) -> bool:
+    """True if this expression tests the platform in any recognisable way."""
+    if node is None:
+        return False
+    for sub in ast.walk(node):
+        text = ""
+        if isinstance(sub, ast.Name):
+            text = sub.id
+        elif isinstance(sub, ast.Attribute):
+            text = sub.attr
+        elif isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+            text = sub.value
+        if any(tok in text.lower() for tok in _PLATFORM_TOKENS):
+            return True
+    return False
+
+
+def _platform_marker_names(tree: ast.Module) -> set[str]:
+    """Module-level names bound to a platform-conditional skipif marker.
+
+    Projects commonly hoist one, e.g.
+        needs_symlinks = pytest.mark.skipif(sys.platform == "win32", reason=...)
+    and then decorate tests with it.
+    """
+    names: set[str] = set()
+    for node in tree.body:
+        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
+            continue
+        called = _dotted(node.value.func).lower()
+        if not any(tok in called for tok in _SKIP_DECORATORS):
+            continue
+        if not any(_mentions_platform(a) for a in [*node.value.args, *(k.value for k in node.value.keywords)]):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                names.add(target.id)
+    return names
+
+
+def _decorated_for_platform(node: ast.AST, marker_names: set[str]) -> bool:
+    """True if a function is decorated with a platform-conditional skip."""
+    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return False
+    for dec in node.decorator_list:
+        if isinstance(dec, ast.Name) and dec.id in marker_names:
+            return True
+        target = dec.func if isinstance(dec, ast.Call) else dec
+        dotted = _dotted(target).lower()
+        if any(tok in dotted for tok in _SKIP_DECORATORS) and isinstance(dec, ast.Call):
+            if any(_mentions_platform(a) for a in [*dec.args, *(k.value for k in dec.keywords)]):
+                return True
+    return False
+
+
 def _handler_is_broad(handler: ast.ExceptHandler) -> bool:
     """True if this `except` would catch a bare OSError."""
     if handler.type is None:  # bare `except:`
@@ -159,23 +227,41 @@ def _suppresses_broadly(item: ast.withitem) -> bool:
     return any(n in _BROAD_EXCEPTIONS for arg in call.args for n in _names_in(arg))
 
 
-def _scan(node: ast.AST, guarded: bool, out: list[tuple[int, str, bool]]) -> None:
-    """Walk the tree, tracking whether we are inside a guard that covers OSError."""
+def _scan(
+    node: ast.AST,
+    guarded: bool,
+    out: list[tuple[int, str, bool]],
+    marker_names: set[str] = frozenset(),  # type: ignore[assignment]
+) -> None:
+    """Walk the tree, tracking whether we are inside a guard covering this call.
+
+    A guard is either an exception handler that catches OSError, or a platform
+    conditional that stops the code running on Windows at all.
+    """
+    if _decorated_for_platform(node, marker_names):
+        guarded = True
+
+    if isinstance(node, ast.If) and _mentions_platform(node.test):
+        # Either branch is platform-conditional; neither runs unconditionally.
+        for child in [*node.body, *node.orelse]:
+            _scan(child, True, out, marker_names)
+        return
+
     if isinstance(node, ast.Try):
         inner = guarded or any(_handler_is_broad(h) for h in node.handlers)
         for child in node.body:
-            _scan(child, inner, out)
+            _scan(child, inner, out, marker_names)
         for handler in node.handlers:
             for child in handler.body:
-                _scan(child, guarded, out)
+                _scan(child, guarded, out, marker_names)
         for child in [*node.orelse, *node.finalbody]:
-            _scan(child, guarded, out)
+            _scan(child, guarded, out, marker_names)
         return
 
     if isinstance(node, (ast.With, ast.AsyncWith)):
         inner = guarded or any(_suppresses_broadly(i) for i in node.items)
         for child in node.body:
-            _scan(child, inner, out)
+            _scan(child, inner, out, marker_names)
         return
 
     if isinstance(node, ast.Call):
@@ -184,7 +270,7 @@ def _scan(node: ast.AST, guarded: bool, out: list[tuple[int, str, bool]]) -> Non
             out.append((node.lineno, why, guarded))
 
     for child in ast.iter_child_nodes(node):
-        _scan(child, guarded, out)
+        _scan(child, guarded, out, marker_names)
 
 
 def privileged_calls(repo: Path) -> tuple[list[Finding], int]:
@@ -202,7 +288,7 @@ def privileged_calls(repo: Path) -> tuple[list[Finding], int]:
             continue
 
         hits: list[tuple[int, str, bool]] = []
-        _scan(tree, False, hits)
+        _scan(tree, False, hits, _platform_marker_names(tree))
         rel = path.relative_to(repo).as_posix()
         for lineno, why, guarded in hits:
             if guarded:
@@ -357,7 +443,8 @@ def self_check() -> int:
     return 0
 
 
-def main(argv: list[str]) -> int:
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv if argv is None else argv)
     if "--self-check" in argv:
         return self_check()
 
