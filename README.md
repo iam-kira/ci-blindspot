@@ -17,6 +17,7 @@ matrix is already green.
 
 ```
 python ci_blindspot.py path/to/repo
+python ci_blindspot.py --survey owner/repo [owner/repo ...]
 python ci_blindspot.py --self-check
 ```
 
@@ -36,6 +37,35 @@ Or install the console command:
 pip install git+https://github.com/iam-kira/ci-blindspot
 ci-blindspot path/to/repo
 ```
+
+## Surveying many repositories
+
+Cloning thirty projects to find the three worth running costs more than it is worth.
+`--survey` asks GitHub's git-trees API which of them commit a symlink at all — one request
+per repo, nothing downloaded:
+
+```
+$ ci-blindspot --survey pydantic/pydantic pallets/click astral-sh/uv
+ci-blindspot survey
+
+pydantic/pydantic: 2 committed symlink(s)
+    CONTRIBUTING.md
+    tests/pydantic_core
+pallets/click: no committed symlinks
+astral-sh/uv: 1 committed symlink(s)
+    test/packages/fake-uv/src
+
+2 of 3 worth cloning. A committed symlink is only a lead: it matters when something reads
+it, which only running the suite shows.
+```
+
+Set `GITHUB_TOKEN` (or `GH_TOKEN`) to lift the anonymous rate limit. A truncated tree is
+reported as such, because the count is then a lower bound.
+
+The last line is the point. `pydantic/pydantic` above is a real find — `tests/pydantic_core`
+is the only path to 5,966 of its 12,274 tests, so an unprivileged Windows checkout silently
+runs less than half the suite and still reports success. `CONTRIBUTING.md` on the same repo
+is a symlink too, and harmless. The survey cannot tell those apart; running the suite can.
 
 ## Does it work?
 
@@ -138,6 +168,7 @@ tracked symlinks in a repo with no Windows CI at all is its own result.
 |---|---|
 | OS matrix across `.github/workflows/*.yml` | Which platforms are tested at all |
 | Files committed as symlinks (git mode `120000`) | Materialise as text files on an unprivileged Windows checkout |
+| The same, across many remote repos (`--survey`) | Narrows a candidate list without cloning anything |
 | `symlink_to` / `os.symlink` / `os.link` | Need elevation or Developer Mode on Windows |
 | `os.fork` / `os.mkfifo` / `os.geteuid` | POSIX-only, no Windows equivalent |
 
@@ -158,6 +189,9 @@ Stated plainly, because a tool that overstates its confidence is worse than no t
   in a disabled or conditional job still counts as covered. It errs toward reporting
   *more* coverage than exists, which makes a "not tested" verdict trustworthy and a
   "tested" verdict weaker.
+- **`--survey` answers a narrower question than the local scan.** It reports committed
+  symlinks and nothing else: no workflow parse, no AST pass, no guard detection. It exists
+  to shorten a clone list, not to reach a verdict.
 - **Windows-centric.** The privilege asymmetry it understands is the Windows one. The same
   class of gap exists elsewhere (containers running as root, macOS entitlements) and is
   not covered.
