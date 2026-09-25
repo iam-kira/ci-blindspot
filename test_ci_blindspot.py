@@ -12,7 +12,15 @@ from pathlib import Path
 
 import pytest
 
-from ci_blindspot import analyse, ci_platforms, render, self_check, tracked_symlinks
+from ci_blindspot import (
+    analyse,
+    ci_platforms,
+    links_in_tree,
+    render,
+    render_survey,
+    self_check,
+    tracked_symlinks,
+)
 
 
 def _repo(tmp_path: Path, workflow: str | None = None, files: dict[str, str] | None = None) -> Path:
@@ -130,3 +138,36 @@ def test_tracked_symlink_detected(tmp_path):
     subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
     subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True)
     assert "link.txt" in tracked_symlinks(tmp_path)
+
+
+def test_links_in_tree_filters_symlinks():
+    tree = {
+        "tree": [
+            {"path": "src/app.py", "mode": "100644"},
+            {"path": "tests/pydantic_core", "mode": "120000"},
+            {"path": "bin", "mode": "040000"},
+            {"path": "CONTRIBUTING.md", "mode": "120000"},
+        ],
+        "truncated": False,
+    }
+    assert links_in_tree(tree) == (["CONTRIBUTING.md", "tests/pydantic_core"], False)
+
+
+def test_links_in_tree_reports_truncation():
+    # A truncated tree makes the count a lower bound, which the report has to say.
+    assert links_in_tree({"tree": [], "truncated": True}) == ([], True)
+
+
+def test_render_survey_separates_hits_from_misses():
+    out = render_survey(
+        [
+            ("pydantic/pydantic", (["tests/pydantic_core"], False)),
+            ("pallets/click", ([], False)),
+            ("some/private", "HTTP 404"),
+        ]
+    )
+    assert "pydantic/pydantic: 1 committed symlink(s)" in out
+    assert "    tests/pydantic_core" in out
+    assert "pallets/click: no committed symlinks" in out
+    assert "some/private: HTTP 404" in out
+    assert "1 of 3 worth cloning" in out

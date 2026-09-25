@@ -15,15 +15,20 @@ on contributor machines forever.
 
 Usage:
     python ci_blindspot.py [path-to-repo]
+    python ci_blindspot.py --survey owner/repo [owner/repo ...]
     python ci_blindspot.py --self-check
 """
 
 from __future__ import annotations
 
 import ast
+import json
+import os
 import re
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -298,6 +303,70 @@ def privileged_calls(repo: Path) -> tuple[list[Finding], int]:
     return findings, guarded_count
 
 
+_API = "https://api.github.com"
+
+
+def links_in_tree(tree: dict) -> tuple[list[str], bool]:
+    """Committed symlinks in a git trees API response, and whether it was truncated.
+
+    Split out from the network call so the filtering is testable without a token or a
+    connection. A truncated tree is reported rather than hidden: the answer is then a
+    lower bound, and the repo needs cloning to be sure.
+    """
+    paths = [e["path"] for e in tree.get("tree", []) if e.get("mode") == "120000"]
+    return sorted(paths), bool(tree.get("truncated"))
+
+
+def _api_get(url: str, token: str | None) -> dict:
+    req = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json"})
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310 - fixed https host
+        return json.load(resp)
+
+
+def survey(slug: str, token: str | None = None) -> tuple[list[str], bool] | str:
+    """Committed symlinks in a remote repo, without cloning it.
+
+    Returns (paths, truncated) or an error string. Cloning thirty repositories to find
+    the three worth running costs more than it is worth; the trees API answers the same
+    question in one request each. This is the step that narrows, not the step that
+    decides - a hit still has to be reproduced locally.
+    """
+    try:
+        meta = _api_get(f"{_API}/repos/{slug}", token)
+        tree = _api_get(f"{_API}/repos/{slug}/git/trees/{meta['default_branch']}?recursive=1", token)
+    except urllib.error.HTTPError as exc:
+        hint = " (set GITHUB_TOKEN to raise the rate limit)" if exc.code in (403, 429) else ""
+        return f"HTTP {exc.code}{hint}"
+    except (urllib.error.URLError, OSError, KeyError, ValueError) as exc:
+        return f"{type(exc).__name__}: {exc}"
+    return links_in_tree(tree)
+
+
+def render_survey(results: list[tuple[str, tuple[list[str], bool] | str]]) -> str:
+    out: list[str] = ["ci-blindspot survey", ""]
+    hits = 0
+    for slug, result in results:
+        if isinstance(result, str):
+            out.append(f"{slug}: {result}")
+            continue
+        paths, truncated = result
+        note = " (tree truncated; lower bound)" if truncated else ""
+        if not paths:
+            out.append(f"{slug}: no committed symlinks{note}")
+            continue
+        hits += 1
+        out.append(f"{slug}: {len(paths)} committed symlink(s){note}")
+        out.extend(f"    {p}" for p in paths)
+    out.append("")
+    out.append(
+        f"{hits} of {len(results)} worth cloning. A committed symlink is only a lead: "
+        "it matters when something reads it, which only running the suite shows."
+    )
+    return "\n".join(out)
+
+
 def analyse(repo: Path) -> Report:
     report = Report()
     report.ci_platforms, report.workflows = ci_platforms(repo)
@@ -447,6 +516,16 @@ def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv if argv is None else argv)
     if "--self-check" in argv:
         return self_check()
+
+    if "--survey" in argv:
+        slugs = argv[argv.index("--survey") + 1:]
+        if not slugs:
+            print("--survey needs at least one owner/repo", file=sys.stderr)
+            return 2
+        token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+        results = [(slug, survey(slug, token)) for slug in slugs]
+        print(render_survey(results))
+        return 1 if any(not isinstance(r, str) and r[0] for _, r in results) else 0
 
     repo = Path(argv[1] if len(argv) > 1 else ".").resolve()
     if not repo.is_dir():
